@@ -1,5 +1,3 @@
-# src/consumer_mysql.py  — Azure MySQL + Kafka, env-bridge
-
 import os
 import json
 import time
@@ -7,12 +5,10 @@ import datetime as dt
 from kafka import KafkaConsumer
 import mysql.connector
 
-# ---------- Kafka setup (bridge new + old env) ----------
 KAFKA_BROKER = os.getenv("KAFKA_BOOTSTRAP") or os.getenv("KAFKA_BROKER", "localhost:9092")
 TOPIC_NAME   = os.getenv("KAFKA_TOPIC") or os.getenv("TOPIC_NAME", "traffic_raw")
 KAFKA_GROUP  = os.getenv("KAFKA_GROUP", "mysql_raw_consumer")
 
-# ---------- MySQL (Azure) ----------
 DB_HOST = os.getenv("DB_HOST") or os.getenv("MYSQL_HOST", "richardsonsql.mysql.database.azure.com")
 DB_PORT = int(os.getenv("DB_PORT") or os.getenv("MYSQL_PORT", "3306"))
 DB_USER = os.getenv("DB_USER") or os.getenv("MYSQL_USER", "utdsql")
@@ -21,7 +17,6 @@ DB_NAME = os.getenv("DB_NAME") or os.getenv("MYSQL_DATABASE", "kafka")
 
 BATCH_SIZE = int(os.getenv("BATCH_ROWS", "200"))
 
-# Connect to MySQL (Azure usually requires SSL; we'll leave ssl_disabled=False)
 db = mysql.connector.connect(
     host=DB_HOST,
     port=DB_PORT,
@@ -35,7 +30,6 @@ cursor = db.cursor()
 cursor.execute("SELECT DATABASE()")
 print("Connected to database:", cursor.fetchone()[0])
 
-# ---------- Ensure table/columns/indexes ----------
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS raw_data_kafka (
     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -169,3 +163,4 @@ print(f"Total runtime: {time.time() - pipeline_start:.2f} seconds")
 
 cursor.close()
 db.close()
+
