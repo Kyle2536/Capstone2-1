@@ -1,0 +1,38 @@
+Connected to database: kafka
+Consuming raw data from Kafka and inserting into MySQL (table: raw_data_kafka)
+Committed 200 rows (total 200)
+Committed 200 rows (total 400)
+Committed 200 rows (total 600)
+Committed 200 rows (total 800)
+Committed 200 rows (total 1000)
+Committed 200 rows (total 1200)
+Committed 200 rows (total 1400)
+Committed 200 rows (total 1600)
+Committed 200 rows (total 1800)
+Committed 200 rows (total 2000)
+Committed 200 rows (total 2200)
+Committed 200 rows (total 2400)
+Committed 200 rows (total 2600)
+Committed 200 rows (total 2800)
+Committed 200 rows (total 3000)
+Traceback (most recent call last):
+  File "C:\Users\Tim A\Downloads\kafkanem\.venv\Lib\site-packages\mysql\connector\connection_cext.py", line 772, in cmd_query
+    self._cmysql.query(
+_mysql_connector.MySQLInterfaceError: Lost connection to MySQL server during query
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Tim A\Downloads\kafkanem\src\consumer_mysql.py", line 159, in <module>
+    cursor.executemany(INSERT_SQL, batch)
+  File "C:\Users\Tim A\Downloads\kafkanem\.venv\Lib\site-packages\mysql\connector\cursor_cext.py", line 473, in executemany
+    return self.execute(cast(str, stmt))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Tim A\Downloads\kafkanem\.venv\Lib\site-packages\mysql\connector\cursor_cext.py", line 353, in execute
+    self._connection.cmd_query(
+  File "C:\Users\Tim A\Downloads\kafkanem\.venv\Lib\site-packages\mysql\connector\opentelemetry\context_propagation.py", line 97, in wrapper
+    return method(cnx, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Tim A\Downloads\kafkanem\.venv\Lib\site-packages\mysql\connector\connection_cext.py", line 781, in cmd_query
+    raise get_mysql_exception(
+mysql.connector.errors.OperationalError: 2013 (HY000): Lost connection to MySQL server during query
