@@ -1,4 +1,3 @@
-
 import os
 import sys
 import traceback
@@ -10,7 +9,10 @@ from flask_cors import CORS
 import mysql.connector
 import certifi
 
-# ----------------- CONFIG -----------------
+# =========================
+# CONFIG
+# =========================
+
 API_PORT = int(os.getenv("API_PORT", "5001"))
 
 DB_HOST = os.getenv("DB_HOST") or os.getenv(
@@ -19,8 +21,8 @@ DB_HOST = os.getenv("DB_HOST") or os.getenv(
 DB_PORT = int(os.getenv("DB_PORT") or os.getenv("MYSQL_PORT", "3306"))
 DB_USER = os.getenv("DB_USER") or os.getenv("MYSQL_USER", "utdsql")
 DB_PASS = (
-    os.getenv("DB_PASS")
-    or os.getenv("DB_PASSWORD")
+    os.getenv("DB_PASSWORD")
+    or os.getenv("DB_PASS")
     or os.getenv("MYSQL_PASSWORD")
     or "Capstone2025!"
 )
@@ -28,21 +30,28 @@ DB_NAME = os.getenv("DB_NAME") or os.getenv("MYSQL_DATABASE", "kafka")
 
 # --------- RUSH TABLES ONLY ---------
 FACT_TABLE = "kafka_pipeline_rush"
+FACT_COL_RECORD = "record_id"
+FACT_COL_RUN = "run_id"
+FACT_COL_TRACE = "trace_id"
+FACT_COL_DATE = "created_at"  # DATE
+FACT_COL_TIME = "ts"          # TIME(3)
 FACT_COL_SPEED = "peakspeed"
 FACT_COL_PMG = "pmgid"
-FACT_COL_TS = "ts"
-FACT_COL_VEH = "vehiclecount"
-FACT_COL_LOCATION = "location"
 FACT_COL_DIRECTION = "direction"
-FACT_COL_RECORD = "record_id"
+FACT_COL_LOCATION = "location"
+FACT_COL_VEH = "vehiclecount"
 
-LAT_VIEW = "kafka_latency_ms_rush"
+# Combined event timestamp used for *all* time logic
+EVENT_TS_EXPR = f"CAST(CONCAT({FACT_COL_DATE}, ' ', {FACT_COL_TIME}) AS DATETIME)"
+
+# Latency table (raw timestamps)
+LAT_VIEW = "kafka_latencies_rush"
 LAT_COL_RECORD = "record_id"
-LAT_COL_STAGE_SENSOR_INGEST = "ms_sensor_to_ingest"
-LAT_COL_STAGE_SENSOR_SQL = "ms_sensor_to_sql"
-LAT_COL_STAGE_SQL_EMIT = "ms_sql_to_emit"
-LAT_COL_STAGE_EMIT_RENDER = "ms_emit_to_render"
-LAT_COL_STAGE_SENSOR_RENDER = "ms_sensor_to_render"  # end-to-end
+LAT_COL_SENSOR_CREATED = "sensor_created_at"
+LAT_COL_INGEST_RECEIVED = "ingest_received_at"
+LAT_COL_SQL_WRITTEN = "sql_written_at"
+LAT_COL_DASHBOARD_EMITTED = "dashboard_emitted_at"
+LAT_COL_DASHBOARD_RENDERED = "dashboard_rendered_at"
 
 # Lookback windows
 TREND_HOURS = int(os.getenv("TREND_HOURS", "6"))
@@ -54,8 +63,10 @@ KPI_MINUTES_DEFAULT = int(os.getenv("KPI_MINUTES", "15"))
 # Latency outlier cap (anything above this ms is ignored in medians/pcts)
 MAX_LAT_MS = int(os.getenv("MAX_LAT_MS", "30000"))  # 30 seconds
 
+# =========================
+# APP + DB HELPERS
+# =========================
 
-# ----------------- APP + DB HELPERS -----------------
 app = Flask(__name__, static_folder=".", static_url_path="")
 CORS(app)
 
@@ -103,19 +114,42 @@ def pct(values, p: float):
     return float(data[i] * (1 - frac) + data[j] * frac)
 
 
+def latest_event_ts():
+    """
+    Latest event timestamp from kafka_pipeline_rush (created_at + ts).
+    Used as the anchor for all time windows so historical data still shows.
+    """
+    rows = q_rows(
+        f"""
+        SELECT MAX({EVENT_TS_EXPR}) AS latest_ts
+        FROM {FACT_TABLE}
+        """
+    )
+    if rows and rows[0][0]:
+        # mysql.connector will give a datetime because of CAST(... AS DATETIME)
+        return rows[0][0]
+    return None
+
+
 def minutes_ago(m: int) -> datetime:
-    return datetime.utcnow() - timedelta(minutes=m)
+    anchor = latest_event_ts() or datetime.utcnow()
+    return anchor - timedelta(minutes=m)
 
 
 def hours_ago(h: int) -> datetime:
-    return datetime.utcnow() - timedelta(hours=h)
+    anchor = latest_event_ts() or datetime.utcnow()
+    return anchor - timedelta(hours=h)
 
 
 def days_ago(d: int) -> datetime:
-    return datetime.utcnow() - timedelta(days=d)
+    anchor = latest_event_ts() or datetime.utcnow()
+    return anchor - timedelta(days=d)
 
 
-# ----------------- ROUTES -----------------
+# =========================
+# ROUTES
+# =========================
+
 @app.get("/")
 def root():
     return send_from_directory(".", "index.html")
@@ -146,12 +180,6 @@ def kpi():
     KPI cards (RUSH-only).
 
     ?mins=N   -> use last N minutes for the window (default KPI_MINUTES_DEFAULT)
-
-    Vehicles / detections:
-      - events_total                  = COUNT(*)
-      - events_per_minute_total       = events_total / window_mins
-      - events_per_minute_per_sensor  = events_total / (window_mins * sensors_active)
-      - sensors_active                = COUNT(DISTINCT pmgid)
     """
     try:
         mins_str = request.args.get("mins")
@@ -160,32 +188,29 @@ def kpi():
         except ValueError:
             window_mins = KPI_MINUTES_DEFAULT
 
-        # Latest speed + timestamp
+        # Latest speed + timestamp (based on EVENT_TS_EXPR)
         latest_row = q_rows(
             f"""
-            SELECT {FACT_COL_SPEED}, {FACT_COL_TS}
+            SELECT {FACT_COL_SPEED},
+                   {EVENT_TS_EXPR} AS event_ts
             FROM {FACT_TABLE}
-            ORDER BY {FACT_COL_TS} DESC
+            ORDER BY event_ts DESC
             LIMIT 1
             """
         )
+
         latest_speed = None
         latest_ts = None
         data_age_seconds = None
+
         if latest_row:
             latest_speed = (
                 float(latest_row[0][0]) if latest_row[0][0] is not None else None
             )
             latest_ts_val = latest_row[0][1]
             if isinstance(latest_ts_val, datetime):
-                if latest_ts_val.tzinfo is not None:
-                    latest_ts_utc = latest_ts_val.astimezone(tz=None).replace(
-                        tzinfo=None
-                    )
-                else:
-                    latest_ts_utc = latest_ts_val
-                data_age_seconds = (datetime.utcnow() - latest_ts_utc).total_seconds()
-                latest_ts = latest_ts_utc
+                latest_ts = latest_ts_val
+                data_age_seconds = (datetime.utcnow() - latest_ts).total_seconds()
 
         since_ts = minutes_ago(window_mins)
 
@@ -197,7 +222,7 @@ def kpi():
               COUNT(*)                       AS events_total,
               COUNT(DISTINCT {FACT_COL_PMG}) AS sensors_active
             FROM {FACT_TABLE}
-            WHERE {FACT_COL_TS} >= %s
+            WHERE {EVENT_TS_EXPR} >= %s
             """,
             (since_ts,),
         )
@@ -223,14 +248,19 @@ def kpi():
             else None
         )
 
-        # Latency for the window (end-to-end = ms_sensor_to_render)
+        # Latency for the window (end-to-end = sensor_created_at -> dashboard_rendered_at)
         lat_rows = q_rows(
             f"""
-            SELECT l.{LAT_COL_STAGE_SENSOR_RENDER}
+            SELECT
+              TIMESTAMPDIFF(
+                  MICROSECOND,
+                  l.{LAT_COL_SENSOR_CREATED},
+                  l.{LAT_COL_DASHBOARD_RENDERED}
+              ) / 1000.0 AS ms_end
             FROM {FACT_TABLE} p
             JOIN {LAT_VIEW}   l
               ON p.{FACT_COL_RECORD} = l.{LAT_COL_RECORD}
-            WHERE p.{FACT_COL_TS} >= %s
+            WHERE {EVENT_TS_EXPR} >= %s
             """,
             (since_ts,),
         )
@@ -272,10 +302,10 @@ def peak_speed_trend():
         since_ts = hours_ago(TREND_HOURS)
         rows = q_rows(
             f"""
-            SELECT DATE_FORMAT({FACT_COL_TS}, '%%Y-%%m-%%d %%H:%%i:00') AS bucket,
+            SELECT DATE_FORMAT({EVENT_TS_EXPR}, '%%Y-%%m-%%d %%H:%%i:00') AS bucket,
                    AVG({FACT_COL_SPEED}) AS avg_speed
             FROM {FACT_TABLE}
-            WHERE {FACT_COL_TS} >= %s
+            WHERE {EVENT_TS_EXPR} >= %s
             GROUP BY bucket
             ORDER BY bucket ASC
             """,
@@ -302,10 +332,10 @@ def throughput_total():
         since_ts = hours_ago(TREND_HOURS)
         rows = q_rows(
             f"""
-            SELECT DATE_FORMAT({FACT_COL_TS}, '%%Y-%%m-%%d %%H:%%i:00') AS bucket,
+            SELECT DATE_FORMAT({EVENT_TS_EXPR}, '%%Y-%%m-%%d %%H:%%i:00') AS bucket,
                    COUNT(*) AS c
             FROM {FACT_TABLE}
-            WHERE {FACT_COL_TS} >= %s
+            WHERE {EVENT_TS_EXPR} >= %s
             GROUP BY bucket
             ORDER BY bucket ASC
             """,
@@ -328,19 +358,24 @@ def throughput_total():
 @app.get("/api/agg/pipeline_latency")
 def pipeline_latency():
     """
-    Latency p50/p90/p99 per minute from kafka_latency_ms_rush (RUSH only),
-    using ms_sensor_to_render as end-to-end latency.
+    Latency p50/p90/p99 per minute from kafka_latencies_rush (RUSH only),
+    using sensor_created_at → dashboard_rendered_at as end-to-end latency.
     """
     try:
         since_ts = hours_ago(TREND_HOURS)
         rows = q_rows(
             f"""
-            SELECT DATE_FORMAT(p.{FACT_COL_TS}, '%%Y-%%m-%%d %%H:%%i:00') AS bucket,
-                   l.{LAT_COL_STAGE_SENSOR_RENDER} AS ms_end
+            SELECT
+              DATE_FORMAT({EVENT_TS_EXPR}, '%%Y-%%m-%%d %%H:%%i:00') AS bucket,
+              TIMESTAMPDIFF(
+                  MICROSECOND,
+                  l.{LAT_COL_SENSOR_CREATED},
+                  l.{LAT_COL_DASHBOARD_RENDERED}
+              ) / 1000.0 AS ms_end
             FROM {FACT_TABLE} p
             JOIN {LAT_VIEW}   l
               ON p.{FACT_COL_RECORD} = l.{LAT_COL_RECORD}
-            WHERE p.{FACT_COL_TS} >= %s
+            WHERE {EVENT_TS_EXPR} >= %s
             ORDER BY bucket ASC
             """,
             (since_ts,),
@@ -403,7 +438,7 @@ def speed_histogram():
             SELECT FLOOR({FACT_COL_SPEED} / %s) * %s AS bin_start,
                    COUNT(*) AS c
             FROM {FACT_TABLE}
-            WHERE {FACT_COL_TS} >= %s
+            WHERE {EVENT_TS_EXPR} >= %s
             GROUP BY bin_start
             ORDER BY bin_start
             """,
@@ -444,9 +479,9 @@ def speed_percentiles_daily():
         since_ts = days_ago(DAILY_DAYS)
         rows = q_rows(
             f"""
-            SELECT DATE({FACT_COL_TS}) AS d, {FACT_COL_SPEED}
+            SELECT DATE({EVENT_TS_EXPR}) AS d, {FACT_COL_SPEED}
             FROM {FACT_TABLE}
-            WHERE {FACT_COL_TS} >= %s
+            WHERE {EVENT_TS_EXPR} >= %s
             ORDER BY d ASC
             """,
             (since_ts,),
@@ -484,7 +519,7 @@ def pmgid_volume():
                    COALESCE(MAX({FACT_COL_LOCATION}), 'Unknown') AS loc,
                    COUNT(*) AS c
             FROM {FACT_TABLE}
-            WHERE {FACT_COL_TS} >= %s
+            WHERE {EVENT_TS_EXPR} >= %s
             GROUP BY {FACT_COL_PMG}
             ORDER BY c DESC
             LIMIT 25
@@ -511,8 +546,6 @@ def pmgid_volume():
 @app.get("/api/agg/speed_vs_vehicle_scatter")
 def speed_vs_vehicle_scatter():
     """
-    Behaviour profile.
-
     Each point is ONE SENSOR (PMGID) in the selected window:
       x = average peak speed at that sensor (mph)
       y = detections per minute at that sensor
@@ -533,7 +566,7 @@ def speed_vs_vehicle_scatter():
                    AVG({FACT_COL_SPEED}) AS avg_speed,
                    COUNT(*)              AS events
             FROM {FACT_TABLE}
-            WHERE {FACT_COL_TS} >= %s
+            WHERE {EVENT_TS_EXPR} >= %s
             GROUP BY {FACT_COL_PMG}
             """,
             (since_ts,),
@@ -561,18 +594,38 @@ def speed_vs_vehicle_scatter():
 @app.get("/api/latency_breakdown_stages")
 def latency_breakdown_stages():
     """
-    Median latency per pipeline stage from kafka_latency_ms_rush.
-    Uses ALL rows in the view (RUSH only), with outliers capped by MAX_LAT_MS.
+    Median latency per pipeline stage from kafka_latencies_rush.
+    Uses ALL rows in the table, with outliers capped by MAX_LAT_MS.
     """
     try:
         rows = q_rows(
             f"""
             SELECT
-              {LAT_COL_STAGE_SENSOR_INGEST},
-              {LAT_COL_STAGE_SENSOR_SQL},
-              {LAT_COL_STAGE_SQL_EMIT},
-              {LAT_COL_STAGE_EMIT_RENDER},
-              {LAT_COL_STAGE_SENSOR_RENDER}
+              TIMESTAMPDIFF(
+                  MICROSECOND,
+                  {LAT_COL_SENSOR_CREATED},
+                  {LAT_COL_INGEST_RECEIVED}
+              ) / 1000.0 AS ms_sensor_to_ingest,
+              TIMESTAMPDIFF(
+                  MICROSECOND,
+                  {LAT_COL_SENSOR_CREATED},
+                  {LAT_COL_SQL_WRITTEN}
+              ) / 1000.0 AS ms_sensor_to_sql,
+              TIMESTAMPDIFF(
+                  MICROSECOND,
+                  {LAT_COL_SQL_WRITTEN},
+                  {LAT_COL_DASHBOARD_EMITTED}
+              ) / 1000.0 AS ms_sql_to_emit,
+              TIMESTAMPDIFF(
+                  MICROSECOND,
+                  {LAT_COL_DASHBOARD_EMITTED},
+                  {LAT_COL_DASHBOARD_RENDERED}
+              ) / 1000.0 AS ms_emit_to_render,
+              TIMESTAMPDIFF(
+                  MICROSECOND,
+                  {LAT_COL_SENSOR_CREATED},
+                  {LAT_COL_DASHBOARD_RENDERED}
+              ) / 1000.0 AS ms_sensor_to_render
             FROM {LAT_VIEW}
             """
         )
@@ -641,7 +694,7 @@ def location_direction_snapshot():
                    COUNT(*) AS c,
                    AVG({FACT_COL_SPEED}) AS avg_speed
             FROM {FACT_TABLE}
-            WHERE {FACT_COL_TS} >= %s
+            WHERE {EVENT_TS_EXPR} >= %s
             GROUP BY locdir
             ORDER BY c DESC
             LIMIT 25
@@ -681,11 +734,11 @@ def hourly_profile():
         since_ts = days_ago(DAILY_DAYS)
         rows = q_rows(
             f"""
-            SELECT HOUR({FACT_COL_TS}) AS h,
-                   COUNT(*)            AS c,
+            SELECT HOUR({EVENT_TS_EXPR}) AS h,
+                   COUNT(*)              AS c,
                    AVG({FACT_COL_SPEED}) AS avg_speed
             FROM {FACT_TABLE}
-            WHERE {FACT_COL_TS} >= %s
+            WHERE {EVENT_TS_EXPR} >= %s
             GROUP BY h
             ORDER BY h
             """,
@@ -707,6 +760,169 @@ def hourly_profile():
         )
 
 
+# =========================
+# NEW GRAPHS (RUSH TABLES)
+# =========================
+
+# ---------- Heatmap: speed × time × vehicle count ----------
+@app.get("/api/heatmap")
+def heatmap():
+    """
+    Heatmap of speed vs time for last 60 minutes
+    using kafka_pipeline_rush (created_at + ts).
+    """
+    try:
+        since_ts = minutes_ago(60)
+        rows = q_rows(
+            f"""
+            SELECT 
+                DATE_FORMAT({EVENT_TS_EXPR}, '%%H:%%i') AS minute_bucket,
+                FLOOR({FACT_COL_SPEED} / 5) * 5 AS speed_bin,
+                COUNT(*) AS c
+            FROM {FACT_TABLE}
+            WHERE {EVENT_TS_EXPR} >= %s
+            GROUP BY minute_bucket, speed_bin
+            ORDER BY minute_bucket ASC, speed_bin ASC
+            """,
+            (since_ts,),
+        )
+
+        if not rows:
+            return jsonify({"times": [], "speeds": [], "values": []})
+
+        times = sorted({row[0] for row in rows})
+        speeds = sorted({int(row[1]) for row in rows})
+
+        t_index = {t: i for i, t in enumerate(times)}
+        s_index = {s: i for i, s in enumerate(speeds)}
+
+        values = []
+        for minute_bucket, speed_bin, count in rows:
+            values.append(
+                [t_index[minute_bucket], s_index[int(speed_bin)], int(count)]
+            )
+
+        return jsonify({"times": times, "speeds": speeds, "values": values})
+
+    except Exception as e:
+        log_exc("heatmap")
+        return jsonify({"times": [], "speeds": [], "values": [], "error": str(e)})
+
+
+# ---------- Bubble map: location points ----------
+@app.get("/api/location_bubble")
+def api_location_bubble():
+    """
+    Bubble map of locations over last 60 minutes.
+    location column is "lat,lon" as text.
+    """
+    try:
+        since_ts = minutes_ago(60)
+        rows = q_rows(
+            f"""
+            SELECT {FACT_COL_LOCATION}, COUNT(*) AS c
+            FROM {FACT_TABLE}
+            WHERE {EVENT_TS_EXPR} >= %s
+            GROUP BY {FACT_COL_LOCATION}
+            """,
+            (since_ts,),
+        )
+
+        points = []
+        for loc, count in rows:
+            if not loc:
+                continue
+            try:
+                lat_str, lon_str = loc.split(",")
+                lat = float(lat_str.strip())
+                lon = float(lon_str.strip())
+                points.append(
+                    {
+                        "x": lon,        # longitude is X
+                        "y": lat,        # latitude is Y
+                        "z": int(count)  # bubble size
+                    }
+                )
+            except Exception:
+                continue
+
+        return jsonify({"points": points})
+
+    except Exception as e:
+        log_exc("location_bubble")
+        return jsonify({"points": [], "error": str(e)})
+
+
+# ---------- Direction distribution ----------
+@app.get("/api/direction_distribution")
+def api_direction_distribution():
+    """
+    Direction distribution over last 60 minutes from kafka_pipeline_rush.
+    """
+    try:
+        since_ts = minutes_ago(60)
+        rows = q_rows(
+            f"""
+            SELECT {FACT_COL_DIRECTION}, COUNT(*) AS c
+            FROM {FACT_TABLE}
+            WHERE {EVENT_TS_EXPR} >= %s
+            GROUP BY {FACT_COL_DIRECTION}
+            """,
+            (since_ts,),
+        )
+
+        data = []
+        for direction, count in rows:
+            label = str(direction)
+            data.append({"name": label, "y": int(count)})
+
+        return jsonify({"data": data})
+
+    except Exception as e:
+        log_exc("direction_distribution")
+        return jsonify({"data": [], "error": str(e)})
+
+
+# ---------- Live peak speed stream ----------
+@app.get("/api/live_speed")
+def api_live_speed():
+    """
+    Last 50 peak-speed samples as a time-of-day stream.
+    Uses kafka_pipeline_rush ts column for X, peakspeed for Y.
+    """
+    try:
+        rows = q_rows(
+            f"""
+            SELECT {FACT_COL_TIME}, {FACT_COL_SPEED}
+            FROM {FACT_TABLE}
+            ORDER BY {FACT_COL_DATE} DESC, {FACT_COL_TIME} DESC
+            LIMIT 50
+            """
+        )
+
+        points = []
+        for ts_val, speed in rows:
+            if speed is None or ts_val is None:
+                continue
+
+            # ts_val is a timedelta-like object (TIME)
+            total_seconds = ts_val.seconds + ts_val.microseconds / 1_000_000
+            ts_ms = int(total_seconds * 1000)
+            points.append([ts_ms, float(speed)])
+
+        points.reverse()
+        return jsonify({"points": points})
+
+    except Exception as e:
+        log_exc("live_speed")
+        return jsonify({"points": [], "error": str(e)})
+
+
+# =========================
+# MAIN
+# =========================
+
 if __name__ == "__main__":
     print(f"Starting analytics API on 0.0.0.0:{API_PORT}")
     app.run(host="0.0.0.0", port=API_PORT, debug=True)
+
