@@ -925,4 +925,3 @@ def api_live_speed():
 if __name__ == "__main__":
     print(f"Starting analytics API on 0.0.0.0:{API_PORT}")
     app.run(host="0.0.0.0", port=API_PORT, debug=True)
-
