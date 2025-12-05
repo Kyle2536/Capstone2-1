@@ -10,6 +10,8 @@
   <script src="https://code.highcharts.com/highcharts-more.js"></script>
   <script src="https://code.highcharts.com/modules/exporting.js"></script>
   <script src="https://code.highcharts.com/modules/accessibility.js"></script>
+  <script src="https://code.highcharts.com/modules/heatmap.js"></script>
+  <script src="https://code.highcharts.com/modules/export-data.js"></script>
 
   <style>
     :root {
@@ -122,7 +124,6 @@
       box-shadow: 0 0 12px rgba(249,115,22,0.9);
     }
 
-    /* Executive summary band */
     .exec-band {
       margin-bottom: 18px;
       border-radius: 22px;
@@ -217,7 +218,6 @@
       color: var(--text-muted);
     }
 
-    /* KPI grid */
     .grid-kpi {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -307,7 +307,6 @@
       background: rgba(15, 23, 42, 0.85);
     }
 
-    /* Toolbar */
     .toolbar {
       display: flex;
       justify-content: space-between;
@@ -373,6 +372,13 @@
     .grid-row {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 4px;
+    }
+
+    .grid-row-full {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
       gap: 14px;
       margin-top: 4px;
     }
@@ -451,7 +457,7 @@
         </div>
         <div class="subtitle">
           Live RUSH feeds → Azure MySQL performance based on the most recent RUSH run.
-          <strong>All speeds in mph. All times in ms.</strong>
+          <strong>All speeds in mph. All times are end-to-end sensor → render in ms.</strong>
         </div>
       </div>
       <div class="header-meta">
@@ -460,8 +466,8 @@
           <span id="health-status">Pipeline: checking…</span>
         </div>
         <div>
-          Data source: <strong>kafka_pipeline_rush</strong> · Latency view:
-          <strong>kafka_latency_ms_rush</strong>
+          Data source: <strong>kafka_pipeline_rush</strong> · Latency table:
+          <strong>kafka_latencies_rush</strong>
         </div>
       </div>
     </header>
@@ -474,7 +480,7 @@
           Waiting for live data…
         </div>
         <div class="exec-subline" id="exec-subline">
-          As data flows in, this line gives a one-sentence story of speed, volume, and latency.
+          As data flows in, this line gives a one-sentence story of speed, volume, and end-to-end latency.
         </div>
         <div class="exec-tags">
           <span class="status-chip" id="status-latency">
@@ -697,6 +703,64 @@
       </article>
     </section>
 
+    <!-- NEW GRAPHS: heatmap + bubble + pie -->
+    <section class="grid-row" style="margin-top: 14px;">
+      <article class="card">
+        <div class="card-inner">
+          <div class="card-title">
+            <span>Speed × Time × Vehicle Count</span>
+            <span class="tag">Heatmap</span>
+          </div>
+          <div class="card-subtitle">
+            Heatmap showing vehicle count intensity across time and speed ranges.
+          </div>
+          <div id="chart-heatmap" class="chart-container"></div>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="card-inner">
+          <div class="card-title">
+            <span>Location Bubble Plot</span>
+            <span class="tag">Coordinates</span>
+          </div>
+          <div class="card-subtitle">
+            Bubble chart plotting sensors by latitude, longitude, and volume.
+          </div>
+          <div id="chart-location-bubble" class="chart-container"></div>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="card-inner">
+          <div class="card-title">
+            <span>Direction Distribution</span>
+            <span class="tag">Pie Chart</span>
+          </div>
+          <div class="card-subtitle">
+            Percentage of detections by travel direction.
+          </div>
+          <div id="chart-direction" class="chart-container"></div>
+        </div>
+      </article>
+    </section>
+
+    <!-- Live Peak Speed Stream full row -->
+    <section class="grid-row-full" style="margin-top: 14px;">
+      <article class="card">
+        <div class="card-inner">
+          <div class="card-title">
+            <span>Live Peak Speed Stream</span>
+            <span class="tag">Live</span>
+          </div>
+          <div class="card-subtitle">
+            Individual peak-speed samples plotted as they arrive (sensor → render).
+          </div>
+          <div id="chart-live-speed" class="chart-container tall"></div>
+        </div>
+      </article>
+    </section>
+
     <footer>
       <span>
         Live RUSH window: <strong id="footer-window"></strong> ·
@@ -707,7 +771,6 @@
   </div>
 
   <script>
-    // Highcharts global styling
     Highcharts.setOptions({
       chart: {
         backgroundColor: "transparent",
@@ -783,7 +846,6 @@
       else chart.hideLoading();
     }
 
-    // ---- KPI & health ----
     async function loadHealth() {
       try {
         const data = await fetchJSON("/api/health");
@@ -871,7 +933,6 @@
       }
       $("status-volume-text").textContent = volText;
 
-      // Executive headline + subline
       const latest = kpi.latest_speed;
       const avgSpeed = kpi.avg_speed;
       const win = kpi.avg_speed_window;
@@ -917,7 +978,7 @@
 
         const stale =
           typeof data.data_age_seconds === "number" &&
-          data.data_age_seconds > 120; // >2 minutes with no new data
+          data.data_age_seconds > 120;
 
         document.body.classList.toggle("stale", stale);
         ["kpi-card-latest", "kpi-card-avg", "kpi-card-det", "kpi-card-lat"].forEach(
@@ -985,7 +1046,6 @@
       }
     }
 
-    // ---- Charts ----
     let chartPeakSpeed,
       chartLatencyTime,
       chartLatencyBreakdown,
@@ -994,16 +1054,18 @@
       chartSpeedScatter,
       chartSpeedDaily,
       chartPmgVolume,
-      chartHourly;
+      chartHourly,
+      chartHeatmap,
+      chartLocationBubble,
+      chartDirectionPie,
+      chartLiveSpeedStream;
 
     function initCharts() {
       chartPeakSpeed = Highcharts.chart("chart-peak-speed", {
         chart: { zoomType: "x" },
         xAxis: { type: "category" },
         yAxis: [
-          {
-            title: { text: "Avg peak speed (mph)" }
-          },
+          { title: { text: "Avg peak speed (mph)" } },
           {
             title: { text: "Events / minute" },
             opposite: true
@@ -1172,6 +1234,69 @@
             tooltip: { valueSuffix: " mph" }
           }
         ]
+      });
+
+      chartHeatmap = Highcharts.chart("chart-heatmap", {
+        chart: { type: "heatmap" },
+        legend: { enabled: true },
+        exporting: { enabled: true },
+        navigation: { buttonOptions: { enabled: true } },
+        xAxis: { title: { text: "Time (min)" }, categories: [] },
+        yAxis: { title: { text: "Speed (mph)" }, categories: [] },
+        colorAxis: {
+          min: 0,
+          stops: [
+            [0, "#1e3a8a"],
+            [0.5, "#3b82f6"],
+            [1, "#f43f5e"]
+          ]
+        },
+        series: [{
+          name: "Vehicle Count",
+          borderWidth: 0,
+          data: []
+        }]
+      });
+
+      chartLocationBubble = Highcharts.chart("chart-location-bubble", {
+        chart: { type: "bubble", plotBorderWidth: 1, zoomType: "xy" },
+        legend: { enabled: true },
+        exporting: { enabled: true },
+        navigation: { buttonOptions: { enabled: true } },
+        xAxis: { title: { text: "Longitude" } },
+        yAxis: { title: { text: "Latitude" } },
+        series: [{
+          name: "Sensors",
+          data: []
+        }]
+      });
+
+      chartDirectionPie = Highcharts.chart("chart-direction", {
+        chart: { type: "pie" },
+        legend: { enabled: true },
+        exporting: { enabled: true },
+        navigation: { buttonOptions: { enabled: true } },
+        series: [{
+          name: "Direction",
+          colorByPoint: true,
+          data: []
+        }]
+      });
+
+      chartLiveSpeedStream = Highcharts.chart("chart-live-speed", {
+        chart: {
+          type: "spline",
+          animation: Highcharts.svg,
+          marginRight: 15
+        },
+        xAxis: { type: "datetime" },
+        yAxis: {
+          title: { text: "Peak speed (mph)" }
+        },
+        series: [{
+          name: "Peak Speed",
+          data: []
+        }]
       });
     }
 
@@ -1378,6 +1503,64 @@
       }
     }
 
+    async function loadHeatmap() {
+      try {
+        const data = await fetchJSON("/api/heatmap");
+        chartHeatmap.xAxis[0].setCategories(data.times || [], false);
+        chartHeatmap.yAxis[0].setCategories(data.speeds || [], false);
+        chartHeatmap.series[0].setData(data.values || [], true);
+        setNoData(chartHeatmap, (data.values || []).length > 0, "No heatmap data");
+      } catch (err) {
+        console.error("heatmap error", err);
+        setNoData(chartHeatmap, false, "Error loading data");
+      }
+    }
+
+    async function loadLocationBubble() {
+      try {
+        const data = await fetchJSON("/api/location_bubble");
+        chartLocationBubble.series[0].setData(data.points || [], true);
+        setNoData(
+          chartLocationBubble,
+          (data.points || []).length > 0,
+          "No location data"
+        );
+      } catch (err) {
+        console.error("bubble error", err);
+        setNoData(chartLocationBubble, false, "Error loading data");
+      }
+    }
+
+    async function loadDirectionPie() {
+      try {
+        const data = await fetchJSON("/api/direction_distribution");
+        chartDirectionPie.series[0].setData(data.data || [], true);
+        setNoData(
+          chartDirectionPie,
+          (data.data || []).length > 0,
+          "No direction data"
+        );
+      } catch (err) {
+        console.error("direction pie error", err);
+        setNoData(chartDirectionPie, false, "Error loading data");
+      }
+    }
+
+    async function loadLiveSpeedStream() {
+      try {
+        const data = await fetchJSON("/api/live_speed");
+        chartLiveSpeedStream.series[0].setData(data.points || [], true);
+        setNoData(
+          chartLiveSpeedStream,
+          (data.points || []).length > 0,
+          "No live speed data"
+        );
+      } catch (err) {
+        console.error("live speed error", err);
+        setNoData(chartLiveSpeedStream, false, "Error loading data");
+      }
+    }
+
     async function loadAll() {
       footerWindow.textContent = `Last ${windowSelect.value} minutes`;
       await Promise.all([
@@ -1390,7 +1573,11 @@
         loadSpeedScatter(),
         loadSpeedDaily(),
         loadPmgVolume(),
-        loadHourlyProfile()
+        loadHourlyProfile(),
+        loadHeatmap(),
+        loadLocationBubble(),
+        loadDirectionPie(),
+        loadLiveSpeedStream()
       ]);
     }
 
