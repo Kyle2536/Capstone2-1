@@ -1,23 +1,26 @@
 import os
 import sys
+import time
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, time
 from collections import defaultdict
 
 from flask import Flask, jsonify, send_from_directory, request
 from flask_cors import CORS
 import mysql.connector
+from mysql.connector import errorcode
 import certifi
 
 # =========================
 # CONFIG
 # =========================
 
+from dotenv import load_dotenv
+load_dotenv()
+
 API_PORT = int(os.getenv("API_PORT", "5001"))
 
-DB_HOST = os.getenv("DB_HOST") or os.getenv(
-    "MYSQL_HOST", "richardsonsql.mysql.database.azure.com"
-)
+DB_HOST = os.getenv("DB_HOST") or os.getenv("MYSQL_HOST", "richardsonsql.mysql.database.azure.com")
 DB_PORT = int(os.getenv("DB_PORT") or os.getenv("MYSQL_PORT", "3306"))
 DB_USER = os.getenv("DB_USER") or os.getenv("MYSQL_USER", "utdsql")
 DB_PASS = (
@@ -63,6 +66,10 @@ KPI_MINUTES_DEFAULT = int(os.getenv("KPI_MINUTES", "15"))
 # Latency outlier cap (anything above this ms is ignored in medians/pcts)
 MAX_LAT_MS = int(os.getenv("MAX_LAT_MS", "30000"))  # 30 seconds
 
+# Retry behavior for transient DB conflicts
+DB_RETRY_MAX = int(os.getenv("DB_RETRY_MAX", "4"))          # attempts
+DB_RETRY_BASE_SLEEP = float(os.getenv("DB_RETRY_SLEEP", "0.15"))  # seconds
+
 # =========================
 # APP + DB HELPERS
 # =========================
@@ -71,8 +78,13 @@ app = Flask(__name__, static_folder=".", static_url_path="")
 CORS(app)
 
 
+def log_exc(tag: str):
+    print(f"\n=== API ERROR [{tag}] ===", file=sys.stderr)
+    traceback.print_exc()
+
+
 def db():
-    """Open a new DB connection."""
+    """Open a new DB connection (reads default to autocommit)."""
     return mysql.connector.connect(
         host=DB_HOST,
         port=DB_PORT,
@@ -81,23 +93,50 @@ def db():
         database=DB_NAME,
         ssl_ca=certifi.where(),
         ssl_disabled=False,
+        autocommit=True,
+        connection_timeout=10,
     )
 
 
+def _is_transient_lock_error(exc: Exception) -> bool:
+    """True for deadlocks / lock wait timeouts that are safe to retry."""
+    if not hasattr(exc, "errno"):
+        return False
+    return exc.errno in (1213, 1205)  # ER_LOCK_DEADLOCK, ER_LOCK_WAIT_TIMEOUT
+
+
 def q_rows(sql, params=()):
-    """Run a query and return all rows."""
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(sql, params)
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return rows
+    """Run a query and return all rows (with retry on deadlock/lock waits)."""
+    attempt = 0
+    while True:
+        try:
+            conn = db()
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+            return rows
+        except mysql.connector.Error as e:
+            attempt += 1
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+            if _is_transient_lock_error(e) and attempt < DB_RETRY_MAX:
+                sleep_s = DB_RETRY_BASE_SLEEP * (2 ** (attempt - 1))
+                time.sleep(sleep_s)
+                continue
+            raise
 
 
-def log_exc(tag: str):
-    print(f"\n=== API ERROR [{tag}] ===", file=sys.stderr)
-    traceback.print_exc()
+def db_utc_now():
+    """
+    Get a UTC "now" directly from MySQL, so age calculations match DB time.
+    """
+    rows = q_rows("SELECT UTC_TIMESTAMP(3)")
+    return rows[0][0] if rows and rows[0][0] else datetime.utcnow()
 
 
 def pct(values, p: float):
@@ -119,30 +158,24 @@ def latest_event_ts():
     Latest event timestamp from kafka_pipeline_rush (created_at + ts).
     Used as the anchor for all time windows so historical data still shows.
     """
-    rows = q_rows(
-        f"""
-        SELECT MAX({EVENT_TS_EXPR}) AS latest_ts
-        FROM {FACT_TABLE}
-        """
-    )
+    rows = q_rows(f"SELECT MAX({EVENT_TS_EXPR}) AS latest_ts FROM {FACT_TABLE}")
     if rows and rows[0][0]:
-        # mysql.connector will give a datetime because of CAST(... AS DATETIME)
-        return rows[0][0]
+        return rows[0][0]  # datetime from CAST(... AS DATETIME)
     return None
 
 
 def minutes_ago(m: int) -> datetime:
-    anchor = latest_event_ts() or datetime.utcnow()
+    anchor = latest_event_ts() or db_utc_now()
     return anchor - timedelta(minutes=m)
 
 
 def hours_ago(h: int) -> datetime:
-    anchor = latest_event_ts() or datetime.utcnow()
+    anchor = latest_event_ts() or db_utc_now()
     return anchor - timedelta(hours=h)
 
 
 def days_ago(d: int) -> datetime:
-    anchor = latest_event_ts() or datetime.utcnow()
+    anchor = latest_event_ts() or db_utc_now()
     return anchor - timedelta(days=d)
 
 
@@ -160,14 +193,7 @@ def health():
     try:
         conn = db()
         conn.close()
-        return jsonify(
-            {
-                "db": DB_NAME,
-                "fact_table": FACT_TABLE,
-                "latency_view": LAT_VIEW,
-                "ok": True,
-            }
-        )
+        return jsonify({"db": DB_NAME, "fact_table": FACT_TABLE, "latency_view": LAT_VIEW, "ok": True})
     except Exception as e:
         log_exc("health")
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -204,13 +230,12 @@ def kpi():
         data_age_seconds = None
 
         if latest_row:
-            latest_speed = (
-                float(latest_row[0][0]) if latest_row[0][0] is not None else None
-            )
+            latest_speed = float(latest_row[0][0]) if latest_row[0][0] is not None else None
             latest_ts_val = latest_row[0][1]
             if isinstance(latest_ts_val, datetime):
                 latest_ts = latest_ts_val
-                data_age_seconds = (datetime.utcnow() - latest_ts).total_seconds()
+                # IMPORTANT FIX: compute "now" using MySQL UTC time to avoid stale false-positives
+                data_age_seconds = (db_utc_now() - latest_ts).total_seconds()
 
         since_ts = minutes_ago(window_mins)
 
@@ -238,12 +263,9 @@ def kpi():
             if agg_row[0][2] is not None:
                 sensors_active = int(agg_row[0][2])
 
-        events_per_minute_total = (
-            float(events_total) / float(window_mins) if window_mins > 0 else None
-        )
+        events_per_minute_total = float(events_total) / float(window_mins) if window_mins > 0 else None
         events_per_minute_per_sensor = (
-            float(events_total)
-            / float(window_mins * sensors_active)
+            float(events_total) / float(window_mins * sensors_active)
             if window_mins > 0 and sensors_active > 0
             else None
         )
@@ -261,9 +283,12 @@ def kpi():
             JOIN {LAT_VIEW}   l
               ON p.{FACT_COL_RECORD} = l.{LAT_COL_RECORD}
             WHERE {EVENT_TS_EXPR} >= %s
+              AND l.{LAT_COL_SENSOR_CREATED} IS NOT NULL
+              AND l.{LAT_COL_DASHBOARD_RENDERED} IS NOT NULL
             """,
             (since_ts,),
         )
+
         lat_values = [
             float(r[0])
             for r in lat_rows
@@ -274,6 +299,7 @@ def kpi():
         return jsonify(
             {
                 "latest_speed": latest_speed,
+                # treat DB timestamps as UTC for client display
                 "latest_ts": latest_ts.isoformat() + "Z" if latest_ts else None,
                 "data_age_seconds": data_age_seconds,
                 "avg_speed_window": window_mins,
@@ -313,12 +339,7 @@ def peak_speed_trend():
         )
         cats = [r[0] for r in rows]
         data = [round(float(r[1] or 0), 2) for r in rows]
-        return jsonify(
-            {
-                "categories": cats,
-                "series": [{"name": "Avg Peak Speed (mph)", "data": data}],
-            }
-        )
+        return jsonify({"categories": cats, "series": [{"name": "Avg Peak Speed (mph)", "data": data}]})
     except Exception as e:
         log_exc("peak_speed_trend")
         return jsonify({"categories": [], "series": [], "error": str(e)}), 500
@@ -343,12 +364,7 @@ def throughput_total():
         )
         cats = [r[0] for r in rows]
         data = [int(r[1]) for r in rows]
-        return jsonify(
-            {
-                "categories": cats,
-                "series": [{"name": "Events / minute", "data": data}],
-            }
-        )
+        return jsonify({"categories": cats, "series": [{"name": "Events / minute", "data": data}]})
     except Exception as e:
         log_exc("throughput_total")
         return jsonify({"categories": [], "series": [], "error": str(e)}), 500
@@ -376,6 +392,8 @@ def pipeline_latency():
             JOIN {LAT_VIEW}   l
               ON p.{FACT_COL_RECORD} = l.{LAT_COL_RECORD}
             WHERE {EVENT_TS_EXPR} >= %s
+              AND l.{LAT_COL_SENSOR_CREATED} IS NOT NULL
+              AND l.{LAT_COL_DASHBOARD_RENDERED} IS NOT NULL
             ORDER BY bucket ASC
             """,
             (since_ts,),
@@ -395,20 +413,10 @@ def pipeline_latency():
         p90 = [pct(buckets[b], 0.9) for b in cats]
         p99 = [pct(buckets[b], 0.99) for b in cats]
 
-        return jsonify(
-            {
-                "categories": cats,
-                "p50": p50,
-                "p90": p90,
-                "p99": p99,
-            }
-        )
+        return jsonify({"categories": cats, "p50": p50, "p90": p90, "p99": p99})
     except Exception as e:
         log_exc("pipeline_latency")
-        return jsonify(
-            {"categories": [], "p50": [], "p90": [], "p99": [], "error": str(e)},
-            500,
-        )
+        return jsonify({"categories": [], "p50": [], "p90": [], "p99": [], "error": str(e)}), 500
 
 
 # ---------- Speed histogram ----------
@@ -453,28 +461,16 @@ def speed_histogram():
             centers.append(int(bin_start) + bw / 2.0)
             counts.append(int(c))
 
-        return jsonify(
-            {
-                "centers": centers,
-                "counts": counts,
-                "bin_width": bw,
-                "window_mins": window_mins,
-            }
-        )
+        return jsonify({"centers": centers, "counts": counts, "bin_width": bw, "window_mins": window_mins})
     except Exception as e:
         log_exc("speed_histogram")
-        return jsonify(
-            {"centers": [], "counts": [], "bin_width": 0, "error": str(e)}, 500
-        )
+        return jsonify({"centers": [], "counts": [], "bin_width": 0, "error": str(e)}), 500
 
 
 # ---------- Daily speed percentiles ----------
 @app.get("/api/agg/speed_percentiles_daily")
 def speed_percentiles_daily():
-    """
-    Daily distribution of peakspeed over the last DAILY_DAYS days.
-    Percentiles: 50th, 85th, 95th.
-    """
+    """Daily distribution of peakspeed over the last DAILY_DAYS days. Percentiles: 50th, 85th, 95th."""
     try:
         since_ts = days_ago(DAILY_DAYS)
         rows = q_rows(
@@ -496,11 +492,7 @@ def speed_percentiles_daily():
         p85 = [pct(by_day[d], 0.85) for d in cats]
         p95 = [pct(by_day[d], 0.95) for d in cats]
 
-        series = [
-            {"name": "p50", "data": p50},
-            {"name": "p85", "data": p85},
-            {"name": "p95", "data": p95},
-        ]
+        series = [{"name": "p50", "data": p50}, {"name": "p85", "data": p85}, {"name": "p95", "data": p95}]
         return jsonify({"categories": cats, "series": series})
     except Exception as e:
         log_exc("speed_percentiles_daily")
@@ -535,8 +527,7 @@ def pmgid_volume():
             cats.append(label)
             counts.append(int(c))
 
-        series = [{"name": "Events", "data": counts}]
-        return jsonify({"categories": cats, "series": series})
+        return jsonify({"categories": cats, "series": [{"name": "Events", "data": counts}]})
     except Exception as e:
         log_exc("pmgid_volume")
         return jsonify({"categories": [], "series": [], "error": str(e)}), 500
@@ -579,12 +570,7 @@ def speed_vs_vehicle_scatter():
             per_min = float(events) / float(window_mins) if window_mins > 0 else 0.0
             pts.append([float(avg_speed), per_min])
 
-        return jsonify(
-            {
-                "window_mins": window_mins,
-                "series": [{"name": "Sensor behaviour", "data": pts}],
-            }
-        )
+        return jsonify({"window_mins": window_mins, "series": [{"name": "Sensor behaviour", "data": pts}]})
     except Exception as e:
         log_exc("speed_vs_vehicle_scatter")
         return jsonify({"series": [], "error": str(e)}), 500
@@ -601,46 +587,18 @@ def latency_breakdown_stages():
         rows = q_rows(
             f"""
             SELECT
-              TIMESTAMPDIFF(
-                  MICROSECOND,
-                  {LAT_COL_SENSOR_CREATED},
-                  {LAT_COL_INGEST_RECEIVED}
-              ) / 1000.0 AS ms_sensor_to_ingest,
-              TIMESTAMPDIFF(
-                  MICROSECOND,
-                  {LAT_COL_SENSOR_CREATED},
-                  {LAT_COL_SQL_WRITTEN}
-              ) / 1000.0 AS ms_sensor_to_sql,
-              TIMESTAMPDIFF(
-                  MICROSECOND,
-                  {LAT_COL_SQL_WRITTEN},
-                  {LAT_COL_DASHBOARD_EMITTED}
-              ) / 1000.0 AS ms_sql_to_emit,
-              TIMESTAMPDIFF(
-                  MICROSECOND,
-                  {LAT_COL_DASHBOARD_EMITTED},
-                  {LAT_COL_DASHBOARD_RENDERED}
-              ) / 1000.0 AS ms_emit_to_render,
-              TIMESTAMPDIFF(
-                  MICROSECOND,
-                  {LAT_COL_SENSOR_CREATED},
-                  {LAT_COL_DASHBOARD_RENDERED}
-              ) / 1000.0 AS ms_sensor_to_render
+              TIMESTAMPDIFF(MICROSECOND, {LAT_COL_SENSOR_CREATED}, {LAT_COL_INGEST_RECEIVED}) / 1000.0 AS ms_sensor_to_ingest,
+              TIMESTAMPDIFF(MICROSECOND, {LAT_COL_SENSOR_CREATED}, {LAT_COL_SQL_WRITTEN}) / 1000.0 AS ms_sensor_to_sql,
+              TIMESTAMPDIFF(MICROSECOND, {LAT_COL_SQL_WRITTEN}, {LAT_COL_DASHBOARD_EMITTED}) / 1000.0 AS ms_sql_to_emit,
+              TIMESTAMPDIFF(MICROSECOND, {LAT_COL_DASHBOARD_EMITTED}, {LAT_COL_DASHBOARD_RENDERED}) / 1000.0 AS ms_emit_to_render,
+              TIMESTAMPDIFF(MICROSECOND, {LAT_COL_SENSOR_CREATED}, {LAT_COL_DASHBOARD_RENDERED}) / 1000.0 AS ms_sensor_to_render
             FROM {LAT_VIEW}
+            WHERE {LAT_COL_SENSOR_CREATED} IS NOT NULL
             """
         )
-        s_ingest = []
-        s_sql = []
-        s_sql_emit = []
-        s_emit_render = []
-        s_end_to_end = []
-        for (
-            ms_ingest,
-            ms_sql,
-            ms_sql_emit,
-            ms_emit_render,
-            ms_render,
-        ) in rows:
+
+        s_ingest, s_sql, s_sql_emit, s_emit_render, s_end_to_end = [], [], [], [], []
+        for ms_ingest, ms_sql, ms_sql_emit, ms_emit_render, ms_render in rows:
             if ms_ingest is not None and float(ms_ingest) <= MAX_LAT_MS:
                 s_ingest.append(float(ms_ingest))
             if ms_sql is not None and float(ms_sql) <= MAX_LAT_MS:
@@ -701,35 +659,22 @@ def location_direction_snapshot():
             """,
             (since_ts,),
         )
-        cats = []
-        vol = []
-        avg = []
+        cats, vol, avg = [], [], []
         for locdir, c, avg_speed in rows:
             cats.append(locdir or "Unknown")
             vol.append(int(c))
             avg.append(float(avg_speed or 0.0))
 
-        return jsonify(
-            {
-                "window_mins": window_mins,
-                "categories": cats,
-                "volume": vol,
-                "avg_speed": avg,
-            }
-        )
+        return jsonify({"window_mins": window_mins, "categories": cats, "volume": vol, "avg_speed": avg})
     except Exception as e:
         log_exc("location_direction_snapshot")
-        return jsonify(
-            {"categories": [], "volume": [], "avg_speed": [], "error": str(e)}, 500
-        )
+        return jsonify({"categories": [], "volume": [], "avg_speed": [], "error": str(e)}), 500
 
 
 # ---------- Hourly profile ----------
 @app.get("/api/hourly_profile")
 def hourly_profile():
-    """
-    Volume & avg speed by hour-of-day over last DAILY_DAYS days.
-    """
+    """Volume & avg speed by hour-of-day over last DAILY_DAYS days."""
     try:
         since_ts = days_ago(DAILY_DAYS)
         rows = q_rows(
@@ -744,9 +689,7 @@ def hourly_profile():
             """,
             (since_ts,),
         )
-        hours = []
-        volume = []
-        avg_speed = []
+        hours, volume, avg_speed = [], [], []
         for h, c, avg_s in rows:
             hours.append(int(h))
             volume.append(int(c))
@@ -755,27 +698,21 @@ def hourly_profile():
         return jsonify({"hours": hours, "volume": volume, "avg_speed": avg_speed})
     except Exception as e:
         log_exc("hourly_profile")
-        return jsonify(
-            {"hours": [], "volume": [], "avg_speed": [], "error": str(e)}, 500
-        )
+        return jsonify({"hours": [], "volume": [], "avg_speed": [], "error": str(e)}), 500
 
 
 # =========================
 # NEW GRAPHS (RUSH TABLES)
 # =========================
 
-# ---------- Heatmap: speed × time × vehicle count ----------
 @app.get("/api/heatmap")
 def heatmap():
-    """
-    Heatmap of speed vs time for last 60 minutes
-    using kafka_pipeline_rush (created_at + ts).
-    """
+    """Heatmap of speed vs time for last 60 minutes using kafka_pipeline_rush."""
     try:
         since_ts = minutes_ago(60)
         rows = q_rows(
             f"""
-            SELECT 
+            SELECT
                 DATE_FORMAT({EVENT_TS_EXPR}, '%%H:%%i') AS minute_bucket,
                 FLOOR({FACT_COL_SPEED} / 5) * 5 AS speed_bin,
                 COUNT(*) AS c
@@ -790,32 +727,25 @@ def heatmap():
         if not rows:
             return jsonify({"times": [], "speeds": [], "values": []})
 
-        times = sorted({row[0] for row in rows})
-        speeds = sorted({int(row[1]) for row in rows})
+        times_list = sorted({row[0] for row in rows})
+        speeds_list = sorted({int(row[1]) for row in rows})
 
-        t_index = {t: i for i, t in enumerate(times)}
-        s_index = {s: i for i, s in enumerate(speeds)}
+        t_index = {t: i for i, t in enumerate(times_list)}
+        s_index = {s: i for i, s in enumerate(speeds_list)}
 
         values = []
         for minute_bucket, speed_bin, count in rows:
-            values.append(
-                [t_index[minute_bucket], s_index[int(speed_bin)], int(count)]
-            )
+            values.append([t_index[minute_bucket], s_index[int(speed_bin)], int(count)])
 
-        return jsonify({"times": times, "speeds": speeds, "values": values})
-
+        return jsonify({"times": times_list, "speeds": speeds_list, "values": values})
     except Exception as e:
         log_exc("heatmap")
         return jsonify({"times": [], "speeds": [], "values": [], "error": str(e)})
 
 
-# ---------- Bubble map: location points ----------
 @app.get("/api/location_bubble")
 def api_location_bubble():
-    """
-    Bubble map of locations over last 60 minutes.
-    location column is "lat,lon" as text.
-    """
+    """Bubble map of locations over last 60 minutes. location column is 'lat,lon' text."""
     try:
         since_ts = minutes_ago(60)
         rows = q_rows(
@@ -836,29 +766,19 @@ def api_location_bubble():
                 lat_str, lon_str = loc.split(",")
                 lat = float(lat_str.strip())
                 lon = float(lon_str.strip())
-                points.append(
-                    {
-                        "x": lon,        # longitude is X
-                        "y": lat,        # latitude is Y
-                        "z": int(count)  # bubble size
-                    }
-                )
+                points.append({"x": lon, "y": lat, "z": int(count)})
             except Exception:
                 continue
 
         return jsonify({"points": points})
-
     except Exception as e:
         log_exc("location_bubble")
         return jsonify({"points": [], "error": str(e)})
 
 
-# ---------- Direction distribution ----------
 @app.get("/api/direction_distribution")
 def api_direction_distribution():
-    """
-    Direction distribution over last 60 minutes from kafka_pipeline_rush.
-    """
+    """Direction distribution over last 60 minutes from kafka_pipeline_rush."""
     try:
         since_ts = minutes_ago(60)
         rows = q_rows(
@@ -873,49 +793,56 @@ def api_direction_distribution():
 
         data = []
         for direction, count in rows:
-            label = str(direction)
-            data.append({"name": label, "y": int(count)})
+            data.append({"name": str(direction), "y": int(count)})
 
         return jsonify({"data": data})
-
     except Exception as e:
         log_exc("direction_distribution")
         return jsonify({"data": [], "error": str(e)})
 
 
-# ---------- Live peak speed stream ----------
+
+
+from datetime import timezone  # add this import (keep your other datetime imports)
+
 @app.get("/api/live_speed")
 def api_live_speed():
     """
-    Last 50 peak-speed samples as a time-of-day stream.
-    Uses kafka_pipeline_rush ts column for X, peakspeed for Y.
+    Last 50 peak-speed samples with a REAL timestamp on the x-axis.
+    Uses created_at + ts (EVENT_TS_EXPR) and treats it as UTC.
     """
     try:
         rows = q_rows(
             f"""
-            SELECT {FACT_COL_TIME}, {FACT_COL_SPEED}
+            SELECT {EVENT_TS_EXPR} AS event_ts, {FACT_COL_SPEED}
             FROM {FACT_TABLE}
-            ORDER BY {FACT_COL_DATE} DESC, {FACT_COL_TIME} DESC
+            ORDER BY event_ts DESC
             LIMIT 50
             """
         )
 
         points = []
-        for ts_val, speed in rows:
-            if speed is None or ts_val is None:
+        for event_ts, speed in rows:
+            if event_ts is None or speed is None:
                 continue
 
-            # ts_val is a timedelta-like object (TIME)
-            total_seconds = ts_val.seconds + ts_val.microseconds / 1_000_000
-            ts_ms = int(total_seconds * 1000)
-            points.append([ts_ms, float(speed)])
+            # DB stores UTC; mysql.connector returns naive datetime -> mark as UTC
+            if event_ts.tzinfo is None:
+                event_ts = event_ts.replace(tzinfo=timezone.utc)
 
-        points.reverse()
+            x_ms = int(event_ts.timestamp() * 1000)
+            points.append([x_ms, float(speed)])
+
+        points.sort(key=lambda p: p[0])
         return jsonify({"points": points})
 
     except Exception as e:
         log_exc("live_speed")
-        return jsonify({"points": [], "error": str(e)})
+        return jsonify({"points": [], "error": str(e)}), 500
+
+
+
+
 
 
 # =========================
@@ -923,5 +850,5 @@ def api_live_speed():
 # =========================
 
 if __name__ == "__main__":
-    print(f"Starting analytics API on 0.0.0.0:{API_PORT}")
+    print(f"Starting analytics API on 0.0.0.0:{API_PORT} (DB={DB_NAME})")
     app.run(host="0.0.0.0", port=API_PORT, debug=True)

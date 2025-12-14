@@ -7,3 +7,4 @@ certifi
 cors
 six
 pylance
+tzdata
